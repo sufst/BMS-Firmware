@@ -1,0 +1,143 @@
+/*
+ * SUFST BMS Custom Board DeviceTree (STM32G474CEU6 - UFQFPN48)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+#include <st/g4/stm32g474Xe.dtsi>
+#include <st/g4/stm32g474c(b-c-e)ux-pinctrl.dtsi>
+
+/ {
+	model = "SUFST Battery Management System (STM32G474CEU6)";
+	compatible = "sufst,bms", "st,stm32g474";
+
+	chosen {
+		zephyr,console = &usart1;
+		zephyr,shell-uart = &usart1;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,canbus = &fdcan1;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	leds: leds {
+		compatible = "gpio-leds";
+
+		status_led: led_0 {
+			/* Update pin to match BMS schematic status LED */
+			gpios = <&gpioa 5 GPIO_ACTIVE_HIGH>;
+			label = "BMS Status LED";
+		};
+	};
+
+	aliases {
+		led0 = &status_led;
+		watchdog0 = &iwdg;
+		die-temp0 = &die_temp;
+		volt-sensor0 = &vref;
+	};
+};
+
+&clk_lsi {
+	status = "okay";
+};
+
+&clk_hsi48 {
+	status = "okay";
+};
+
+/*
+ * Default clock setup uses internal 16 MHz HSI -> PLL -> 170 MHz SYSCLK
+ * so the board boots without depending on an external crystal.
+ * When using an external HSE crystal on the PCB, enable &clk_hse and
+ * switch &pll clocks to <&clk_hse>.
+ */
+&clk_hsi {
+	status = "okay";
+};
+
+&pll {
+	div-m = <4>;
+	mul-n = <85>;
+	div-p = <7>;
+	div-q = <2>;
+	div-r = <2>;
+	clocks = <&clk_hsi>;
+	status = "okay";
+};
+
+&rcc {
+	clocks = <&pll>;
+	clock-frequency = <DT_FREQ_M(170)>;
+	ahb-prescaler = <1>;
+	apb1-prescaler = <1>;
+	apb2-prescaler = <1>;
+};
+
+&usart1 {
+	pinctrl-0 = <&usart1_tx_pa9 &usart1_rx_pa10>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+&spi1 {
+	pinctrl-0 = <&spi1_sck_pa5 &spi1_miso_pa6 &spi1_mosi_pa7>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_scl_pb8 &i2c1_sda_pb9>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&fdcan1 {
+	clocks = <&rcc STM32_CLOCK(APB1, 25)>,
+		 <&rcc STM32_SRC_PLL_Q FDCAN_SEL(1)>;
+	pinctrl-0 = <&fdcan1_rx_pa11 &fdcan1_tx_pa12>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&iwdg {
+	status = "okay";
+};
+
+&die_temp {
+	status = "okay";
+};
+
+&vref {
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 DT_SIZE_K(48)>;
+		};
+
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000c000 DT_SIZE_K(228)>;
+		};
+
+		slot1_partition: partition@45000 {
+			label = "image-1";
+			reg = <0x00045000 DT_SIZE_K(230)>;
+		};
+
+		storage_partition: partition@7e800 {
+			label = "storage";
+			reg = <0x0007e800 DT_SIZE_K(6)>;
+		};
+	};
+};
+

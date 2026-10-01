@@ -1,0 +1,18 @@
+identifier: sufst_bms
+name: SUFST BMS Custom PCB (STM32G474CEU6)
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+ram: 128
+flash: 512
+supported:
+  - can
+  - gpio
+  - i2c
+  - spi
+  - uart
+  - watchdog
+vendor: sufst
+

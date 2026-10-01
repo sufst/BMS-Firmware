@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Enable UART driver & Console
+CONFIG_SERIAL=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y
+
+# Enable GPIO
+CONFIG_GPIO=y
+
+# Enable ARM MPU & Hardware Stack Protection
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+

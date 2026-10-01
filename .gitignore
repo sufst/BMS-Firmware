@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+twister-out*/
+
+# West & local workspace directories (in case west is run in-tree)
+.west/
+.venv/
+venv/
+
+# IDE & OS files
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled / debug outputs
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.dmp
+

@@ -1,0 +1,7 @@
+board:
+  name: sufst_bms
+  full_name: SUFST BMS Custom PCB (STM32G474CEU6)
+  vendor: sufst
+  socs:
+    - name: stm32g474xx
+
