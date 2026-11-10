@@ -6,9 +6,25 @@
 LOG_MODULE_REGISTER(bms_main, LOG_LEVEL_INF);
 
 static struct bms_ctx bms;
+static K_MUTEX_DEFINE(bms_mutex);
+
+struct bms_ctx *bms_ctx_get(void)
+{
+	return &bms;
+}
+
+void bms_ctx_lock(void)
+{
+	k_mutex_lock(&bms_mutex, K_FOREVER);
+}
+
+void bms_ctx_unlock(void)
+{
+	k_mutex_unlock(&bms_mutex);
+}
 
 /**
- * @brief Temporary stub to populate nominal pack & AMC3330 measurements
+ * @brief Temporary stub to populate nominal cell & AMC3330 measurements
  *        until the physical ADC/GPIO pins and AFE driver are wired up.
  */
 static void update_mock_measurements(struct bms_ctx *ctx)
@@ -20,7 +36,6 @@ static void update_mock_measurements(struct bms_ctx *ctx)
 	ctx->min_temp_deci_c  = 240;     /* 24.0 C */
 	ctx->max_temp_deci_c  = 265;     /* 26.5 C */
 	ctx->sum_cells_mv     = 371000U; /* 371.0 V */
-	ctx->pack_current_ma  = 0;
 
 	/* Mock AMC3330 U4 (ACCU) & U3 (DC-LINK) differential outputs + DIAG pins */
 	ctx->hv_sense.accu.mock_diag_ok   = true;
@@ -29,16 +44,38 @@ static void update_mock_measurements(struct bms_ctx *ctx)
 	ctx->hv_sense.dclink.mock_diff_mv = amc3330_hv_mv_to_diff_mv(0U);      /* 0 V when AIRs open */
 }
 
+/**
+ * @brief Pull the latest IVT-S readings into the BMS context.
+ */
+static void update_current_measurement(struct bms_ctx *ctx)
+{
+	ivt_s_get(&ctx->ivt);
+
+	if (ctx->ivt.ch[IVT_S_CH_I].seen) {
+		ctx->pack_current_ma   = BMS_CURRENT_SENSOR_SIGN * ctx->ivt.ch[IVT_S_CH_I].value;
+		ctx->current_sensor_ok = true;
+	}
+}
+
 int main(void)
 {
 	LOG_INF("SUFST BMS Firmware Initialized (%s)", CONFIG_BOARD_TARGET);
 
+	bms_ctx_lock();
 	bms_sm_init(&bms);
+	bms_ctx_unlock();
+
+	if (ivt_s_init() < 0) {
+		LOG_ERR("IVT-S current sensor CAN init failed; BMS will stay in INIT");
+	}
 
 	while (1) {
+		bms_ctx_lock();
 		update_mock_measurements(&bms);
+		update_current_measurement(&bms);
 		bms_sm_tick(&bms);
 		bms_safety_check(&bms, BMS_SM_TICK_MS);
+		bms_ctx_unlock();
 
 		k_sleep(K_MSEC(BMS_SM_TICK_MS));
 	}

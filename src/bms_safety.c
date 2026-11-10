@@ -5,13 +5,14 @@
  * Evaluates all accumulator safety limits every cycle:
  *   - Cell Over-Voltage (OV) & Under-Voltage (UV)      [100 ms debounce]
  *   - Cell Over-Temperature (> 60 C) & Under-Temp      [500 ms debounce]
- *   - Pack Over-Current                                [100 ms debounce]
+ *   - Discharge / Regen Over-Current (asymmetric)      [100 ms debounce]
+ *   - Charging / Regen Below Min Charge Temperature    [500 ms debounce]
  *   - Cell / Thermistor Open-Wire                      [100 ms debounce]
  *   - Sensor Implausibility (out-of-range / V mismatch)[100 ms debounce]
  *   - AFE Communication Heartbeat Timeout              [250 ms timeout]
+ *   - IVT-S Current Sensor Timeout / Reported Error    [100 ms]
  */
 
-#include <stdlib.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -91,6 +92,65 @@ static bool is_sensor_implausible(const struct bms_ctx *ctx)
 }
 
 /* ==========================================================================
+ * Regen Limit Derating
+ * ========================================================================== */
+
+/**
+ * @brief Linear derating factor in permille (0..1000) for one measurement.
+ *
+ * Returns 1000 at or beyond @p full_at, 0 at or beyond @p zero_at, and a
+ * linear ramp in between. Works for either direction (full_at above or
+ * below zero_at).
+ */
+static uint32_t derate_permille(int32_t value, int32_t full_at, int32_t zero_at)
+{
+	if (full_at > zero_at) {
+		/* Mirror so that the ramp always falls as the value rises */
+		value   = -value;
+		full_at = -full_at;
+		zero_at = -zero_at;
+	}
+
+	if (value <= full_at) {
+		return 1000U;
+	}
+	if (value >= zero_at) {
+		return 0U;
+	}
+
+	return (uint32_t)(((zero_at - value) * 1000) / (zero_at - full_at));
+}
+
+uint32_t bms_regen_limit_ma(const struct bms_ctx *ctx)
+{
+	if (ctx->state != BMS_STATE_ACTIVE ||
+	    ctx->live_faults != BMS_FAULT_NONE ||
+	    ctx->latched_faults != BMS_FAULT_NONE) {
+		return 0U;
+	}
+
+	uint32_t factor = derate_permille(ctx->max_cell_mv,
+					  BMS_REGEN_FULL_CELL_MV,
+					  BMS_REGEN_ZERO_CELL_MV);
+
+	factor = MIN(factor, derate_permille(ctx->min_temp_deci_c,
+					     BMS_REGEN_FULL_COLD_DECI_C,
+					     BMS_REGEN_ZERO_COLD_DECI_C));
+
+	factor = MIN(factor, derate_permille(ctx->max_temp_deci_c,
+					     BMS_REGEN_FULL_HOT_DECI_C,
+					     BMS_REGEN_ZERO_HOT_DECI_C));
+
+	return ((uint32_t)BMS_CURRENT_MAX_REGEN_MA * factor) / 1000U;
+}
+
+static void update_regen_outputs(struct bms_ctx *ctx)
+{
+	ctx->out.max_regen_current_ma = bms_regen_limit_ma(ctx);
+	ctx->out.regen_allowed        = (ctx->out.max_regen_current_ma > 0U);
+}
+
+/* ==========================================================================
  * Public API Implementation
  * ========================================================================== */
 
@@ -101,6 +161,7 @@ void bms_safety_check(struct bms_ctx *ctx, uint32_t dt_ms)
 	 * isolated DC/DC converters powered up with DIAG = HIGH).
 	 */
 	if (ctx->state == BMS_STATE_INIT || !ctx->afe_init_ok) {
+		update_regen_outputs(ctx);
 		return;
 	}
 
@@ -142,15 +203,49 @@ void bms_safety_check(struct bms_ctx *ctx, uint32_t dt_ms)
 		BMS_FAULT_UNDER_TEMP,
 		&ctx->live_faults);
 
-	/* 5. Pack Over-Current (|I_pack| > 250 A for >= 100 ms) */
-	int32_t abs_current_ma = abs(ctx->pack_current_ma);
+	/* 5a. Discharge Over-Current (I_pack > +I_max_discharge for >= 100 ms) */
 	evaluate_debounced_fault(
-		(abs_current_ma > BMS_CURRENT_MAX_MA),
+		(ctx->pack_current_ma > BMS_CURRENT_MAX_DISCHARGE_MA),
 		&ctx->fault_timers.over_current_ms,
 		BMS_DEBOUNCE_CURRENT_MS,
 		dt_ms,
 		BMS_FAULT_OVER_CURRENT,
 		&ctx->live_faults);
+
+	/* 5b. Regen / Charge Over-Current (I_pack < -I_max_regen for >= 100 ms) */
+	evaluate_debounced_fault(
+		(ctx->pack_current_ma < -BMS_CURRENT_MAX_REGEN_MA),
+		&ctx->fault_timers.regen_over_current_ms,
+		BMS_DEBOUNCE_CURRENT_MS,
+		dt_ms,
+		BMS_FAULT_REGEN_OVER_CURRENT,
+		&ctx->live_faults);
+
+	/* 5c. Charging / regen while coldest cell is below 0.0 C (>= 500 ms) */
+	evaluate_debounced_fault(
+		(ctx->pack_current_ma < -BMS_CHARGE_DETECT_MA &&
+		 ctx->min_temp_deci_c < BMS_TEMP_CHARGE_MIN_DECI_C),
+		&ctx->fault_timers.charge_under_temp_ms,
+		BMS_DEBOUNCE_CHARGE_TEMP_MS,
+		dt_ms,
+		BMS_FAULT_CHARGE_UNDER_TEMP,
+		&ctx->live_faults);
+
+	/* 5d. IVT-S current sensor: reported error (>= 100 ms) or frame timeout (> 100 ms) */
+	const struct ivt_s_reading *ivt_i = &ctx->ivt.ch[IVT_S_CH_I];
+
+	evaluate_debounced_fault(
+		((ivt_i->state & (IVT_S_STATE_RESULT_ERROR | IVT_S_STATE_SYSTEM_ERROR)) != 0U),
+		&ctx->fault_timers.current_sensor_ms,
+		BMS_DEBOUNCE_CURRENT_SENSOR_MS,
+		dt_ms,
+		BMS_FAULT_CURRENT_SENSOR,
+		&ctx->live_faults);
+
+	if (!ivt_i->seen ||
+	    (k_uptime_get() - ivt_i->rx_ms) > (int64_t)BMS_CURRENT_SENSOR_TIMEOUT_MS) {
+		ctx->live_faults |= BMS_FAULT_CURRENT_SENSOR;
+	}
 
 	/* 6. Sense Wire / Thermistor Open-Wire (>= 100 ms) */
 	evaluate_debounced_fault(
@@ -188,4 +283,7 @@ void bms_safety_check(struct bms_ctx *ctx, uint32_t dt_ms)
 	if (ctx->live_faults != BMS_FAULT_NONE) {
 		bms_sm_raise_fault(ctx, ctx->live_faults);
 	}
+
+	/* Refresh the advisory regen limit last so a fault raised above zeroes it */
+	update_regen_outputs(ctx);
 }

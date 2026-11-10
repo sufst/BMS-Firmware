@@ -12,6 +12,7 @@
 
 #include "bms_hv_sense.h"
 #include "drv3946.h"
+#include "ivt_s.h"
 
 /* ==========================================================================
  * Timing & Precharge Configuration Constants
@@ -60,8 +61,55 @@
 /** Implausibly low temperature reading in 0.1 deg C (-40.0 C, open NTC) */
 #define BMS_TEMP_IMPLAUSIBLE_LOW_DECI_C    (-400)
 
-/** Maximum allowed absolute pack current in mA (250.0 A) */
-#define BMS_CURRENT_MAX_MA                 250000
+/**
+ * Maximum allowed discharge current in mA (200.0 A, pack_current_ma > +limit).
+ * Set by the inverter's maximum DC current draw.
+ */
+#define BMS_CURRENT_MAX_DISCHARGE_MA       200000
+
+/**
+ * Maximum allowed regen / charge current in mA (40.5 A, pack_current_ma < -limit).
+ * Pack is 140s3p Molicel INR-21700-P45B: 13.5 A max charge per cell x 3 parallel.
+ */
+#define BMS_CURRENT_MAX_REGEN_MA           40500
+
+/**
+ * Sign applied to the IVT-S current reading so that positive = discharge.
+ * Set to -1 if the sensor is mounted with its current direction reversed.
+ */
+#define BMS_CURRENT_SENSOR_SIGN            1
+
+/** Charge current magnitude above which the pack counts as "charging" (1.0 A) */
+#define BMS_CHARGE_DETECT_MA               1000
+
+/** Minimum cell temperature for charging / regen in 0.1 deg C (0.0 C) */
+#define BMS_TEMP_CHARGE_MIN_DECI_C         0
+
+/* ==========================================================================
+ * Regen Derating Window (advisory limit broadcast to VCU / inverter)
+ *
+ * The limit ramps linearly from BMS_CURRENT_MAX_REGEN_MA at the "FULL" point
+ * down to 0 at the "ZERO" point. Each ZERO point sits inside its hard fault
+ * threshold so a compliant inverter never trips the BMS.
+ * ========================================================================== */
+
+/** Highest cell voltage at which full regen is still allowed (4.100 V) */
+#define BMS_REGEN_FULL_CELL_MV             4100
+
+/** Highest cell voltage at which regen is cut to zero (4.180 V) */
+#define BMS_REGEN_ZERO_CELL_MV             4180
+
+/** Lowest cell temperature at which full regen is allowed (10.0 C) */
+#define BMS_REGEN_FULL_COLD_DECI_C         100
+
+/** Lowest cell temperature at which regen is cut to zero (2.0 C) */
+#define BMS_REGEN_ZERO_COLD_DECI_C         20
+
+/** Highest cell temperature at which full regen is allowed (50.0 C) */
+#define BMS_REGEN_FULL_HOT_DECI_C          500
+
+/** Highest cell temperature at which regen is cut to zero (58.0 C) */
+#define BMS_REGEN_ZERO_HOT_DECI_C          580
 
 /** Maximum allowed mismatch between sum of cells and HV pack sensor (5.0 V) */
 #define BMS_PACK_SUM_MAX_MISMATCH_MV       5000U
@@ -79,6 +127,9 @@
 /** Over/under-temperature debounce duration (ms) - FS max allowed: 1000 ms */
 #define BMS_DEBOUNCE_TEMP_MS               500U
 
+/** Charging below minimum charge temperature debounce duration (ms) */
+#define BMS_DEBOUNCE_CHARGE_TEMP_MS        500U
+
 /** Open-wire detection debounce duration (ms) */
 #define BMS_DEBOUNCE_OPEN_WIRE_MS          100U
 
@@ -87,6 +138,12 @@
 
 /** Maximum time without a valid AFE update before faulting (ms) */
 #define BMS_AFE_COMM_TIMEOUT_MS            250U
+
+/** Maximum time without an IVT-S current frame before faulting (ms, sensor cycle is 20 ms) */
+#define BMS_CURRENT_SENSOR_TIMEOUT_MS      100U
+
+/** IVT-S reported result / system error debounce duration (ms) */
+#define BMS_DEBOUNCE_CURRENT_SENSOR_MS     100U
 
 /* ==========================================================================
  * BMS States
@@ -113,12 +170,15 @@ typedef enum {
 #define BMS_FAULT_CELL_UV             (1U << 1) /**< Cell under-voltage */
 #define BMS_FAULT_OVER_TEMP           (1U << 2) /**< Cell/pack over-temperature */
 #define BMS_FAULT_UNDER_TEMP          (1U << 3) /**< Cell/pack under-temperature */
-#define BMS_FAULT_OVER_CURRENT        (1U << 4) /**< Pack over-current */
+#define BMS_FAULT_OVER_CURRENT        (1U << 4) /**< Pack discharge over-current */
 #define BMS_FAULT_AFE_COMM            (1U << 5) /**< AFE isoSPI communication loss */
 #define BMS_FAULT_OPEN_WIRE           (1U << 6) /**< Cell sense/thermistor open wire */
 #define BMS_FAULT_PRECHARGE_TIMEOUT   (1U << 7) /**< Precharge failed to reach target V */
 #define BMS_FAULT_IMPLAUSIBILITY      (1U << 8) /**< Sensor reading implausibility */
 #define BMS_FAULT_CONTACTOR_DRV       (1U << 9) /**< DRV3946-Q1 contactor driver nFAULT / SPI error */
+#define BMS_FAULT_REGEN_OVER_CURRENT  (1U << 10) /**< Pack regen / charge over-current */
+#define BMS_FAULT_CHARGE_UNDER_TEMP   (1U << 11) /**< Charging / regen below minimum charge temperature */
+#define BMS_FAULT_CURRENT_SENSOR      (1U << 12) /**< IVT-S current sensor timeout or reported error */
 
 /* ==========================================================================
  * BMS Context & IO State
@@ -135,6 +195,8 @@ struct bms_outputs {
 	bool ts_ready;             /**< BMS -> VCU (CAN/GPIO): AIRs have power & SDC can close */
 	bool ts_active;            /**< BMS -> VCU (CAN/GPIO): Precharge complete & both AIRs closed */
 	bool balancing_enabled;    /**< Cell balancing active flag */
+	bool regen_allowed;        /**< BMS -> VCU (CAN): true when max_regen_current_ma > 0 */
+	uint32_t max_regen_current_ma; /**< BMS -> VCU (CAN): derated regen current limit (mA, magnitude) */
 };
 
 /**
@@ -157,6 +219,9 @@ struct bms_safety_timers {
 	uint32_t over_temp_ms;
 	uint32_t under_temp_ms;
 	uint32_t over_current_ms;
+	uint32_t regen_over_current_ms;
+	uint32_t charge_under_temp_ms;
+	uint32_t current_sensor_ms;
 	uint32_t open_wire_ms;
 	uint32_t implausibility_ms;
 };
@@ -184,22 +249,19 @@ struct bms_ctx {
 	bool afe_open_wire;        /**< Reported by AFE open-wire diagnostic check */
 	int64_t last_afe_rx_ms;    /**< Uptime timestamp (ms) of last valid AFE sample */
 
+	/* IVT-S current sensor (CAN) */
+	struct ivt_s_data ivt;     /**< Latest IVT-S readings (all channels) */
+	bool current_sensor_ok;    /**< Set true once the first IVT-S current frame arrives */
+
 	/* Pack & DC bus measurements (updated by sensor/AFE layer) */
 	uint32_t sum_cells_mv;     /**< Sum of all individual cell voltages from AFE (mV) */
 	uint32_t pack_voltage_mv;  /**< Total accumulator voltage from HV pack sensor (mV) */
 	uint32_t ts_voltage_mv;    /**< Tractive System / inverter DC-link voltage (mV) */
-	int32_t  pack_current_ma;  /**< Pack current (mA, positive = discharge) */
+	int32_t  pack_current_ma;  /**< Pack current from IVT-S (mA, positive = discharge) */
 	uint16_t min_cell_mv;      /**< Lowest single cell voltage (mV) */
 	uint16_t max_cell_mv;      /**< Highest single cell voltage (mV) */
 	int16_t  min_temp_deci_c;  /**< Lowest cell temperature (0.1 deg C) */
 	int16_t  max_temp_deci_c;  /**< Highest cell temperature (0.1 deg C) */
-
-	/*
-	 * TODO (Regen):
-	 *   - Split over-current fault check into asymmetric discharge vs. regen/charge limits.
-	 *   - Enforce low-temperature charge cutoff (0 C) when current is negative (charging/regen).
-	 *   - Compute regen_allowed / max_regen_current_ma in bms_outputs for VCU/Inverter CAN.
-	 */
 
 	struct bms_requests req;
 	struct bms_outputs out;
@@ -258,5 +320,34 @@ const char *bms_state_to_str(bms_state_t state);
  * @param dt_ms Elapsed time since last check in milliseconds (e.g. BMS_SM_TICK_MS).
  */
 void bms_safety_check(struct bms_ctx *ctx, uint32_t dt_ms);
+
+/**
+ * @brief Compute the derated regen current limit for the current measurements.
+ *
+ * Returns 0 unless the BMS is in BMS_STATE_ACTIVE with no live or latched
+ * faults. Otherwise returns BMS_CURRENT_MAX_REGEN_MA scaled by the most
+ * restrictive of the cell-voltage, cold-temperature and hot-temperature
+ * derating ramps (see BMS_REGEN_* constants).
+ *
+ * @param ctx Pointer to BMS context structure.
+ * @return Allowed regen current magnitude in mA.
+ */
+uint32_t bms_regen_limit_ma(const struct bms_ctx *ctx);
+
+/* ==========================================================================
+ * Shared Context Access (main.c)
+ * ========================================================================== */
+
+/**
+ * @brief Get the single BMS context owned by the main control loop.
+ *        Hold bms_ctx_lock() while reading or modifying it from another thread.
+ */
+struct bms_ctx *bms_ctx_get(void);
+
+/** @brief Lock the BMS context (held by the main loop for each control tick). */
+void bms_ctx_lock(void);
+
+/** @brief Unlock the BMS context. */
+void bms_ctx_unlock(void);
 
 #endif /* SUFST_BMS_H_ */

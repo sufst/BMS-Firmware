@@ -103,6 +103,7 @@ bool bms_sm_is_ts_ready(const struct bms_ctx *ctx)
 {
 	return ctx->afe_init_ok &&
 	       ctx->hv_sense_valid &&
+	       ctx->current_sensor_ok &&
 	       (ctx->live_faults == BMS_FAULT_NONE) &&
 	       (ctx->latched_faults == BMS_FAULT_NONE) &&
 	       (ctx->state != BMS_STATE_INIT) &&
@@ -266,7 +267,7 @@ void bms_sm_tick(struct bms_ctx *ctx)
 	/* 4. Forward state progression */
 	switch (ctx->state) {
 	case BMS_STATE_INIT:
-		if (ctx->afe_init_ok && ctx->hv_sense_valid) {
+		if (ctx->afe_init_ok && ctx->hv_sense_valid && ctx->current_sensor_ok) {
 			transition_to(ctx, BMS_STATE_STANDBY);
 		}
 		break;

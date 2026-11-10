@@ -13,10 +13,10 @@
 
 	chosen {
 		zephyr,console = &usart1;
-		zephyr,shell-uart = &usart1;
+		zephyr,shell-uart = &cdc_acm_uart0;
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,canbus = &fdcan1;
+		zephyr,canbus = &fdcan2;
 		zephyr,code-partition = &slot0_partition;
 	};
 
@@ -32,6 +32,7 @@
 
 	aliases {
 		led0 = &status_led;
+		ivt-can = &fdcan2;
 		watchdog0 = &iwdg;
 		die-temp0 = &die_temp;
 		volt-sensor0 = &vref;
@@ -93,12 +94,41 @@
 	status = "okay";
 };
 
-&fdcan1 {
+/*
+ * PA11 / PA12 are the only USB D- / D+ pins on the 48-pin package, so CAN
+ * uses FDCAN2 and FDCAN3 instead of FDCAN1. Pin choices are placeholders
+ * until the PCB is final (alternatives: FDCAN2 on PB5/PB6, FDCAN3 on PB3/PB4,
+ * FDCAN1 on PB8/PB9 - note PB8 is BOOT0).
+ */
+&fdcan2 {
 	clocks = <&rcc STM32_CLOCK(APB1, 25)>,
 		 <&rcc STM32_SRC_PLL_Q FDCAN_SEL(1)>;
-	pinctrl-0 = <&fdcan1_rx_pa11 &fdcan1_tx_pa12>;
+	pinctrl-0 = <&fdcan2_rx_pb12 &fdcan2_tx_pb13>;
+	pinctrl-names = "default";
+	bitrate = <500000>; /* IVT-S factory default */
+	status = "okay";
+};
+
+&fdcan3 {
+	clocks = <&rcc STM32_CLOCK(APB1, 25)>,
+		 <&rcc STM32_SRC_PLL_Q FDCAN_SEL(1)>;
+	pinctrl-0 = <&fdcan3_rx_pa8 &fdcan3_tx_pa15>;
 	pinctrl-names = "default";
 	status = "okay";
+};
+
+/*
+ * USB full-speed device, clocked from HSI48 (default CLK48 source). HSI48 is
+ * trimmed against USB SOF by the CRS, enabled in src/bms_usb.c.
+ */
+zephyr_udc0: &usb {
+	pinctrl-0 = <&usb_dm_pa11 &usb_dp_pa12>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
 };
 
 &iwdg {

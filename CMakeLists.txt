@@ -14,4 +14,7 @@ target_sources(app PRIVATE
     src/bms_safety.c
     src/drv3946.c
     src/bms_hv_sense.c
+    src/bms_shell.c
+    src/bms_usb.c
+    src/ivt_s.c
 )
